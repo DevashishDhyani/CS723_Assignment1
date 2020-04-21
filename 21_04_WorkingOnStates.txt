@@ -2,10 +2,12 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdio.h>
 
 #include "system.h"                     // to use the symbolic names
+#include "io.h"
 #include "altera_avalon_pio_regs.h" 	// to use PIO functions
+#include "altera_up_avalon_ps2.h"
+#include "altera_up_ps2_keyboard.h"
 #include "alt_types.h"                 	// alt_u32 is a kind of alt_types
 #include "sys/alt_irq.h"              	// to register interrupts
 
@@ -63,9 +65,109 @@ unsigned int getsem_task1_got_sem = 0;
 unsigned int getsem_task2_got_sem = 0;
 char sem_owner_task_name[20];
 
+//threshold via KB
+int thresholdFreq = 50;
+char tempThresholdFreq[4] = "";
+
+//global for state toggle
+int stateToggle = 0; //0 = maintenance mode, 1 = freq relay mode
+
+
 // Local Function Prototypes
 int initOSDataStructs(void);
 int initCreateTasks(void);
+
+
+
+void freq_relay(){
+	unsigned int temp = IORD(FREQUENCY_ANALYSER_BASE, 0);
+	//printf("%f Hz\n", 16000/(double)temp);
+	return;
+}
+
+
+void ps2_isr (void* context, alt_u32 id)
+{
+  char ascii;
+  int status = 0;
+  unsigned char key = 0;
+  KB_CODE_TYPE decode_mode;
+  status = decode_scancode (context, &decode_mode , &key , &ascii) ;
+  if ( status == 0 ) //success
+  {
+    // print out the result
+    switch ( decode_mode )
+    {
+      case KB_ASCII_MAKE_CODE :
+        //printf ( "ASCII   : %x\n", key ) ;
+        break ;
+      case KB_LONG_BINARY_MAKE_CODE :
+        // do nothing
+      case KB_BINARY_MAKE_CODE :
+        //printf ( "MAKE CODE : %x\n", key ) ;
+        break ;
+      case KB_BREAK_CODE :
+        // do nothing
+      default :
+        //printf ( "\n DEFAULT   : %x\n", key) ;
+        //printf("\nThe value of key : %d", key);
+    	printf("\n");
+    	int z = (int)(key); // Using typecasting
+
+        if(z == 112){
+        	strcat(tempThresholdFreq, "0");
+        	//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+        }
+        else if(z == 105){
+            strcat(tempThresholdFreq, "1");
+            //printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+        }
+        else if(z == 114){
+        	strcat(tempThresholdFreq, "2");
+        	//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+        }
+        else if(z == 122){
+        	strcat(tempThresholdFreq, "3");
+        	//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+		}
+		else if(z == 107){
+			strcat(tempThresholdFreq, "4");
+			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+		}
+		else if(z == 115){
+			strcat(tempThresholdFreq, "5");
+			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+		}
+		else if(z == 116){
+			strcat(tempThresholdFreq, "6");
+			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+		}
+		else if(z == 108){
+			strcat(tempThresholdFreq, "7");
+			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+		}
+		else if(z == 117){
+			strcat(tempThresholdFreq, "8");
+			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+		}
+		else if(z == 125){
+			strcat(tempThresholdFreq, "9");
+			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+		}
+		else if(z == 90){
+			thresholdFreq = atoi(tempThresholdFreq);
+			tempThresholdFreq[0] = '\0';
+
+			printf("\nThe value of thresholdFreq : %d", thresholdFreq);
+			//printf ("\nThe value of tempThresholdFreq : %s\n", tempThresholdFreq);
+		}
+
+        break ;
+    }
+
+    IOWR(SEVEN_SEG_BASE,0 ,key);
+  }
+}
 
 
 // first we write our interrupt function
@@ -78,6 +180,7 @@ void button_interrupts_function(void* context, alt_u32 id)
   //for key3
   if(*temp==4) {
 	  printf("State change button pressed \n \n");
+	  stateToggle = !stateToggle;
   }
 
   // clears the edge capture register
@@ -105,6 +208,8 @@ void switches_task(void *pvParameters)
 
 	while (1)
 	{
+		//figure out a way to make sure this while loops isn't
+		//causing busy waiting.
 		//vTaskDelay(100);
 	}
 }
@@ -147,7 +252,7 @@ void lcd_task2(void *pvParameters)
 {
 	while (1)
 	{
-		//insert some code here to request semophore
+		//insert some code here to request semaphore
 		xSemaphoreTake(shared_lcd_sem, portMAX_DELAY);
 
 		// if the lcd is open successfully
@@ -272,6 +377,25 @@ void receive_task2(void *pvParameters)
 
 int main(int argc, char* argv[], char* envp[])
 {
+	//FREQUENCY ISR
+	alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, freq_relay);
+
+
+	//KEYBOARD ISR
+	alt_up_ps2_dev * ps2_device = alt_up_ps2_open_dev(PS2_NAME);
+
+    if(ps2_device == NULL){
+    	printf("can't find PS/2 device\n");
+    	return 1;
+    }
+
+    alt_up_ps2_clear_fifo (ps2_device) ;
+
+    alt_irq_register(PS2_IRQ, ps2_device, ps2_isr);
+    // register the PS/2 interrupt
+    IOWR_8DIRECT(PS2_BASE,4,1);
+
+
 	//BUTTON ISR
 	int buttonValue = 0;
 	// clears the edge capture register. Writing 1 to bit clears pending interrupt for corresponding button.
@@ -280,6 +404,7 @@ int main(int argc, char* argv[], char* envp[])
 	IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x7);
 	// register the ISR
 	alt_irq_register(PUSH_BUTTON_IRQ,(void*)&buttonValue, button_interrupts_function);
+
 
 	//LCD
 	lcd = fopen(CHARACTER_LCD_NAME, "w");
@@ -324,5 +449,6 @@ int initCreateTasks(void)
 
 	return 0;
 }
+
 
 
