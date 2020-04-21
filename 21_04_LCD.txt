@@ -32,8 +32,7 @@
 #define SEND_TASK_PRIORITY        9
 
 #define COUNTER_TASK_PRIORITY 6
-#define LCD_TASK1_PRIORITY  17
-#define LCD_TASK2_PRIORITY  16
+
 
 #define SWITCHES_TASK_PRIORITY 1
 
@@ -52,6 +51,7 @@ TaskHandle_t xHandle;
 // Definition of Semaphore
 SemaphoreHandle_t shared_resource_sem;
 SemaphoreHandle_t shared_lcd_sem;
+SemaphoreHandle_t shared_sevenseg_sem;
 
 //Definition of Timer
 TimerHandle_t timer_switches;
@@ -65,6 +65,14 @@ unsigned int getsem_task1_got_sem = 0;
 unsigned int getsem_task2_got_sem = 0;
 char sem_owner_task_name[20];
 
+//threshold via KB
+int thresholdFreq = 50;
+char tempThresholdFreq[4] = "";
+
+//global for state toggle
+int stateToggle = 0; //0 = maintenance mode, 1 = freq relay mode
+
+
 // Local Function Prototypes
 int initOSDataStructs(void);
 int initCreateTasks(void);
@@ -73,7 +81,7 @@ int initCreateTasks(void);
 
 void freq_relay(){
 	unsigned int temp = IORD(FREQUENCY_ANALYSER_BASE, 0);
-	printf("%f Hz\n", 16000/(double)temp);
+	//printf("%f Hz\n", 16000/(double)temp);
 	return;
 }
 
@@ -91,20 +99,71 @@ void ps2_isr (void* context, alt_u32 id)
     switch ( decode_mode )
     {
       case KB_ASCII_MAKE_CODE :
-        printf ( "ASCII   : %x\n", key ) ;
+        //printf ( "ASCII   : %x\n", key ) ;
         break ;
       case KB_LONG_BINARY_MAKE_CODE :
         // do nothing
       case KB_BINARY_MAKE_CODE :
-        printf ( "MAKE CODE : %x\n", key ) ;
+        //printf ( "MAKE CODE : %x\n", key ) ;
         break ;
       case KB_BREAK_CODE :
         // do nothing
       default :
-        printf ( "DEFAULT   : %x\n", key ) ;
+    	printf("\n");
+    	int z = (int)(key); // Using typecasting
+
+        if(z == 112){
+        	strcat(tempThresholdFreq, "0");
+        	//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+        }
+        else if(z == 105){
+            strcat(tempThresholdFreq, "1");
+            //printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+        }
+        else if(z == 114){
+        	strcat(tempThresholdFreq, "2");
+        	//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+        }
+        else if(z == 122){
+        	strcat(tempThresholdFreq, "3");
+        	//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+		}
+		else if(z == 107){
+			strcat(tempThresholdFreq, "4");
+			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+		}
+		else if(z == 115){
+			strcat(tempThresholdFreq, "5");
+			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+		}
+		else if(z == 116){
+			strcat(tempThresholdFreq, "6");
+			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+		}
+		else if(z == 108){
+			strcat(tempThresholdFreq, "7");
+			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+		}
+		else if(z == 117){
+			strcat(tempThresholdFreq, "8");
+			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+		}
+		else if(z == 125){
+			strcat(tempThresholdFreq, "9");
+			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+		}
+		else if(z == 90){
+			thresholdFreq = atoi(tempThresholdFreq);
+			tempThresholdFreq[0] = '\0';
+			printf("\nThe value of thresholdFreq : %d", thresholdFreq);
+			//printf ("\nThe value of tempThresholdFreq : %s\n", tempThresholdFreq);
+		}
+		else {
+			//do nothing
+		}
+
         break ;
     }
-    IOWR(SEVEN_SEG_BASE,0 ,key);
   }
 }
 
@@ -119,6 +178,7 @@ void button_interrupts_function(void* context, alt_u32 id)
   //for key3
   if(*temp==4) {
 	  printf("State change button pressed \n \n");
+	  stateToggle = !stateToggle;
   }
 
   // clears the edge capture register
@@ -146,6 +206,8 @@ void switches_task(void *pvParameters)
 
 	while (1)
 	{
+		//figure out a way to make sure this while loops isn't
+		//causing busy waiting.
 		//vTaskDelay(100);
 	}
 }
@@ -153,85 +215,39 @@ void switches_task(void *pvParameters)
 // For exercise in lab
 void counter_task(void *pvParameters)
 {
-	int counter = 0;
 	while (1)
 	{
-		counter++;
-		IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEG_BASE, counter);
+		xSemaphoreTake(shared_sevenseg_sem, portMAX_DELAY);
+		IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEG_BASE, 19);
+		xSemaphoreGive(shared_sevenseg_sem);
+
 		vTaskDelay(1000);
 	}
 }
 
-void lcd_task1(void *pvParameters)
-{
-	while (1)
-	{
-		//insert some code here to request semophore
-		xSemaphoreTake(shared_lcd_sem, portMAX_DELAY);
-
-		// if the lcd is open successfully
-		if(lcd != NULL)
-		{
-			// clearing the LCD
-			fprintf(lcd, "%c%s", ESC, CLEAR_LCD_STRING);
-			fprintf(lcd, "LCD task 1\n");
-		}
-
-		//insert some code to release the semophore
-		xSemaphoreGive(shared_lcd_sem);
-
-		vTaskDelay(5000);
-	}
-}
-
-void lcd_task2(void *pvParameters)
-{
-	while (1)
-	{
-		//insert some code here to request semophore
-		xSemaphoreTake(shared_lcd_sem, portMAX_DELAY);
-
-		// if the lcd is open successfully
-		if(lcd != NULL)
-		{
-			// clearing the LCD
-			fprintf(lcd, "%c%s", ESC, CLEAR_LCD_STRING);
-			fprintf(lcd, "LCD task 2\n");
-		}
-
-		//insert some code to release the semophore
-		xSemaphoreGive(shared_lcd_sem);
-
-		vTaskDelay(3000);
-	}
-}
 
 // The following test prints out status information every 3 seconds.
 void print_status_task(void *pvParameters)
 {
+	//gets triggered on a Queue for RoC
 	while (1)
 	{
-		vTaskDelay(3000);
-		/*
-		printf("****************************************************************\n");
-		printf("Hello From FreeRTOS Running on NIOS II.  Here is the status:\n");
-		printf("\n");
-		printf("The number of messages sent by the send_task:         %d\n", number_of_messages_sent);
-		printf("\n");
-		printf("The number of messages received by the receive_task1: %d\n", number_of_messages_received_task1);
-		printf("\n");
-		printf("The number of messages received by the receive_task2: %d\n", number_of_messages_received_task2);
-		printf("\n");
-		printf("The shared resource is owned by: %s\n", &sem_owner_task_name[0]);
-		printf("\n");
-		printf("The Number of times getsem_task1 acquired the semaphore %d\n", getsem_task1_got_sem);
-		printf("\n");
-		printf("The Number of times getsem_task2 acquired the semaphore %d\n", getsem_task2_got_sem);
-		printf("\n");
-		printf("****************************************************************\n");
-		printf("\n");
-		*/
-		printf("****************************************************************\n");
+		xSemaphoreTake(shared_lcd_sem, portMAX_DELAY);
+
+		// if the lcd is open successfully
+		if(lcd != NULL)
+		{
+			// clearing the LCD
+			fprintf(lcd, "%c%s", ESC, CLEAR_LCD_STRING);
+			fprintf(lcd, "Threshold = %d \n", thresholdFreq);
+			fprintf(lcd, "RoC = %d \n", 15);
+		}
+
+		//insert some code to release the semophore
+		xSemaphoreGive(shared_lcd_sem);
+
+		vTaskDelay(1000);
+		//printf("****************************************************************\n");
 	}
 }
 
@@ -364,6 +380,7 @@ int initOSDataStructs(void)
 	msgqueue = xQueueCreate( MSG_QUEUE_SIZE, sizeof( void* ) );
 	shared_resource_sem = xSemaphoreCreateCounting( 9999, 1 );
 	shared_lcd_sem = xSemaphoreCreateCounting( 9999, 1 );
+	shared_sevenseg_sem = xSemaphoreCreateCounting( 9999, 1 );
 	return 0;
 }
 
@@ -378,9 +395,6 @@ int initCreateTasks(void)
 	xTaskCreate(print_status_task, "print_status_task", TASK_STACKSIZE, NULL, PRINT_STATUS_TASK_PRIORITY, NULL);
 	xTaskCreate(counter_task, "counter_task", TASK_STACKSIZE, NULL, COUNTER_TASK_PRIORITY, NULL);
 
-	xTaskCreate(lcd_task1, "lcd_task1", TASK_STACKSIZE, NULL, LCD_TASK1_PRIORITY, NULL);
-	xTaskCreate(lcd_task2, "lcd_task2", TASK_STACKSIZE, NULL, LCD_TASK2_PRIORITY, NULL);
-
 	xTaskCreate(switches_task, "switches_task", TASK_STACKSIZE, NULL, SWITCHES_TASK_PRIORITY, NULL);
 
 	return 0;
@@ -388,3 +402,51 @@ int initCreateTasks(void)
 
 
 
+
+//Helper Functions
+// function to convert decimal to hexadecimal
+int decToHexa(int n)
+{
+    // char array to store hexadecimal number
+    char hexaDeciNum[100];
+    char correctOrder[100];
+    int tempPos = 0;
+
+    // counter for hexadecimal number array
+    int i = 0;
+    while(n!=0)
+    {
+        // temporary variable to store remainder
+        int temp  = 0;
+
+        // storing remainder in temp variable.
+        temp = n % 16;
+
+        // check if temp < 10
+        if(temp < 10)
+        {
+            hexaDeciNum[i] = temp + 48;
+            i++;
+        }
+        else
+        {
+            hexaDeciNum[i] = temp + 55;
+            i++;
+        }
+
+        n = n/16;
+    }
+
+    // printing hexadecimal number array in reverse order
+    for(int j=i-1; j>=0; j--) {
+        //printf("%c",hexaDeciNum[j]);
+        //strcat(correctOrder,hexaDeciNum[j]);
+    	correctOrder[tempPos] = hexaDeciNum[j];
+    	tempPos++;
+    }
+
+
+    printf("%s \n", correctOrder);
+    printf("%d", atoi(correctOrder));
+    return(atoi(correctOrder));
+}
