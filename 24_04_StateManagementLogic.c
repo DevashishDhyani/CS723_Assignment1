@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 #include "system.h"                     // to use the symbolic names
 #include "io.h"
@@ -25,9 +26,11 @@
 
 // Definition of Task Priorities
 #define SEVEN_SEG_TASK_PRIORITY 1  //seven seg related
+#define PRINT_LCD_TASK_PRIORITY 2
+#define PRINT_CONSOLE_TASK_PRIORITY 3
 
-#define SWITCHES_TASK_PRIORITY 3
-#define PRINT_STATUS_TASK_PRIORITY 2
+#define SWITCHES_TASK_PRIORITY 4
+
 #define UPDATE_LOAD_TASK_PRIORITY 5
 #define STABILITY_TASK_PRIORITY 6
 
@@ -50,26 +53,33 @@ TaskHandle_t xHandle;
 
 // Definition of Semaphore
 SemaphoreHandle_t shared_lcd_sem;
+SemaphoreHandle_t shared_console_sem;
 SemaphoreHandle_t shared_sevenseg_sem;
-SemaphoreHandle_t shared_freq_sem;
+SemaphoreHandle_t shared_freq_sem; //protects freqArray, rocArray
 
 //Definition of Timer
-
+TimerHandle_t systemTimer;
 
 // globals variables
 
 //threshold via KB
 int thresholdFreq = 50;
-char tempThresholdFreq[4] = "";
+char tempThreshold[4] = "";
+int thresholdROC = 10;
 
 //state toggle
 int stateToggle = 0; //0 = maintenance mode, 1 = freq relay mode
 
 //frequency related
-double freqArray[FREQ_QUEUE_SIZE];
-double rocArray[FREQ_QUEUE_SIZE];
+double freqArray[FREQ_QUEUE_SIZE] = {40, 40, 40, 40, 40, 40, 40, 40, 40, 40};
+double rocArray[FREQ_QUEUE_SIZE] = {40, 40, 40, 40, 40, 40, 40, 40, 40, 40};
 int freqIndex = 0;
-int freqIndexNew = 1;
+int stabilityControl = 0; //0= stable, 1 = unstable
+
+//time related
+int secondsCounter = 0;
+
+
 
 //debug variables
 unsigned int debugCounter =0;
@@ -82,10 +92,19 @@ int initCreateTasks(void);
 void freq_relay(){
 	unsigned int temp = IORD(FREQUENCY_ANALYSER_BASE, 0);
 	double tempFreq = 16000/(double) temp;
+	//printf("%d\n", debugCounter);
+	//debugCounter++;
 	//printf("%f Hz in being SENT \n", 16000/(double)temp);
 	xQueueSendToFrontFromISR(freqQueue, &tempFreq, pdFALSE);
 	return;
 }
+
+
+//for system time
+void vSystemRunTimer(xTimerHandle t_timer){
+	secondsCounter = secondsCounter + 1;
+}
+
 
 void ps2_isr (void* context, alt_u32 id)
 {
@@ -114,53 +133,59 @@ void ps2_isr (void* context, alt_u32 id)
     	int z = (int)(key); // Using typecasting
 
         if(z == 112){
-        	strcat(tempThresholdFreq, "0");
-        	//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+        	strcat(tempThreshold, "0");
+        	//printf ( "DEFAULT   : %s\n", tempThreshold);
         }
         else if(z == 105){
-            strcat(tempThresholdFreq, "1");
-            //printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+            strcat(tempThreshold, "1");
+            //printf ( "DEFAULT   : %s\n", tempThreshold);
         }
         else if(z == 114){
-        	strcat(tempThresholdFreq, "2");
-        	//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+        	strcat(tempThreshold, "2");
+        	//printf ( "DEFAULT   : %s\n", tempThreshold);
         }
         else if(z == 122){
-        	strcat(tempThresholdFreq, "3");
-        	//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+        	strcat(tempThreshold, "3");
+        	//printf ( "DEFAULT   : %s\n", tempThreshold);
 		}
 		else if(z == 107){
-			strcat(tempThresholdFreq, "4");
-			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+			strcat(tempThreshold, "4");
+			//printf ( "DEFAULT   : %s\n", tempThreshold);
 		}
 		else if(z == 115){
-			strcat(tempThresholdFreq, "5");
-			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+			strcat(tempThreshold, "5");
+			//printf ( "DEFAULT   : %s\n", tempThreshold);
 		}
 		else if(z == 116){
-			strcat(tempThresholdFreq, "6");
-			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+			strcat(tempThreshold, "6");
+			//printf ( "DEFAULT   : %s\n", tempThreshold);
 		}
 		else if(z == 108){
-			strcat(tempThresholdFreq, "7");
-			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+			strcat(tempThreshold, "7");
+			//printf ( "DEFAULT   : %s\n", tempThreshold);
 		}
 		else if(z == 117){
-			strcat(tempThresholdFreq, "8");
-			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+			strcat(tempThreshold, "8");
+			//printf ( "DEFAULT   : %s\n", tempThreshold);
 		}
 		else if(z == 125){
-			strcat(tempThresholdFreq, "9");
-			//printf ( "DEFAULT   : %s\n", tempThresholdFreq);
+			strcat(tempThreshold, "9");
+			//printf ( "DEFAULT   : %s\n", tempThreshold);
 		}
-		else if(z == 90){
-			thresholdFreq = atoi(tempThresholdFreq);
-			tempThresholdFreq[0] = '\0';
-			printf("\nThe value of thresholdFreq : %d", thresholdFreq);
-			//printf ("\nThe value of tempThresholdFreq : %s\n", tempThresholdFreq);
+		else if(z == 43){ //f
+			thresholdFreq = atoi(tempThreshold);
+			tempThreshold[0] = '\0';
+			//printf("\nThe value of thresholdFreq : %d", thresholdFreq);
+			//printf ("\nThe value of tempThreshold : %s\n", tempThreshold);
+		}
+		else if(z == 45) { //r
+			thresholdROC = atoi(tempThreshold);
+			tempThreshold[0] = '\0';
+			//printf("\nThe value of thresholdROC : %d", thresholdROC);
 		}
 		else {
 			//do nothing
+			tempThreshold[0] = '\0'; //for any random keystroke, reset temp variable
 		}
 
         break ;
@@ -195,7 +220,7 @@ void switches_task(void *pvParameters)
 		// write the value of the switches to the red LEDs
 		IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiSwitchValue);
 
-		vTaskDelay(200);
+		vTaskDelay(100);
 	}
 }
 
@@ -208,21 +233,39 @@ void stability_task(void *pvParameters)
 
 		xSemaphoreTake(shared_freq_sem, portMAX_DELAY);
 
-		//printf("%d\n", debugCounter);
 		//printf("%f Hz in being RECEIVED\n", freqArray[freqIndex]);
-		//debugCounter++;
 
 		//find ROC
+		if(freqIndex == 0){
+			double oldF = freqArray[9];
+			double newF = freqArray[0];
+			rocArray[0] = fabs(((newF - oldF) * newF * oldF * 2.0) / (newF + oldF));
+		} else {
+			double oldF = freqArray[freqIndex-1];
+			double newF = freqArray[freqIndex];
+			rocArray[freqIndex] = fabs(((newF - oldF) * newF * oldF * 2.0) / (newF + oldF));
+		}
 
+
+		//check if stability conditions are violated
+		if((freqArray[freqIndex] < thresholdFreq) || (rocArray[freqIndex] > thresholdROC)) {
+			stabilityControl = 1;
+		}
+		else {
+			stabilityControl = 0;
+		}
+
+		/*
+		printf("%f Instantaneous Frequency\n", freqArray[freqIndex]);
+		printf("%d Frequency Threshold\n", thresholdFreq);
+		printf("%f ROC calculated\n", rocArray[freqIndex]);
+		printf("%d ROC Threshold\n", thresholdROC);
+		printf("%d Stability \n", stabilityControl);
+		*/
 
 		freqIndex = freqIndex+1;  //next element to be written to
 		if(freqIndex >= FREQ_QUEUE_SIZE) {
 			freqIndex = 0;
-		}
-
-		freqIndexNew = freqIndexNew+1;
-		if(freqIndexNew >= FREQ_QUEUE_SIZE) {
-			freqIndexNew = 0;
 		}
 
 		xSemaphoreGive(shared_freq_sem);
@@ -246,15 +289,15 @@ void seven_seg_task(void *pvParameters)
 	while (1)
 	{
 		xSemaphoreTake(shared_sevenseg_sem, portMAX_DELAY);
-		IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEG_BASE, 19);
+		IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEG_BASE, 318818083);
 		xSemaphoreGive(shared_sevenseg_sem);
 		vTaskDelay(10000);
 	}
 }
 
 
-// The following test prints out status information every 3 seconds.
-void print_status_task(void *pvParameters)
+// The following prints lcd status information every 0.5 seconds.
+void print_lcd_task(void *pvParameters)
 {
 	//gets triggered on a Queue for RoC
 	while (1)
@@ -267,11 +310,63 @@ void print_status_task(void *pvParameters)
 			// clearing the LCD
 			fprintf(lcd, "%c%s", ESC, CLEAR_LCD_STRING);
 			fprintf(lcd, "Threshold = %d \n", thresholdFreq);
-			fprintf(lcd, "RoC = %d \n", 15);
+			fprintf(lcd, "RoC = %d \n", thresholdROC);
 		}
 
 		//insert some code to release the semophore
 		xSemaphoreGive(shared_lcd_sem);
+
+		vTaskDelay(500);
+	}
+}
+
+// The following prints lcd status information every 0.5 seconds.
+void print_console_task(void *pvParameters)
+{
+	//gets triggered on a Queue for RoC
+	while (1)
+	{
+		xSemaphoreTake(shared_console_sem, portMAX_DELAY);
+
+		xSemaphoreTake(shared_freq_sem, portMAX_DELAY);
+
+		printf("Frequency = ");
+
+		if(freqIndex >= 5) {
+			for(int i=0; i<=4; i++) {
+				printf("%f = %d ", freqArray[freqIndex-1-i], freqIndex-1-i);
+			}
+		}
+		else {
+			for(int i=0; i<=4; i++) {
+				if((freqIndex-1-i) >= 0) {
+					printf("%f = %d ", freqArray[freqIndex-1-i], freqIndex-1-i);
+				}
+				else {
+					if((freqIndex-1-i) == -1) {
+						printf("%f = %d ", freqArray[9], 9);
+					}
+					else if((freqIndex-1-i) == -2) {
+						printf("%f = %d ", freqArray[8], 8);
+					}
+					else if((freqIndex-1-i) == -3) {
+						printf("%f = %d ", freqArray[7], 7);
+					}
+					else if((freqIndex-1-i) == -4) {
+						printf("%f = %d ", freqArray[6], 6);
+					}
+				}
+			}
+		}
+
+
+		printf("\n");
+
+		printf("Total time system has been active = %d seconds \n", secondsCounter);
+
+		xSemaphoreGive(shared_freq_sem);
+
+		xSemaphoreGive(shared_console_sem);
 
 		vTaskDelay(1000);
 	}
@@ -280,6 +375,13 @@ void print_status_task(void *pvParameters)
 
 int main(int argc, char* argv[], char* envp[])
 {
+	//TIMER ISR for System
+	systemTimer = xTimerCreate("System Timer", 1000, pdTRUE, NULL, vSystemRunTimer);
+	if (xTimerStart(systemTimer, 0) != pdPASS){
+		printf("Cannot start timer");
+	}
+
+
 	//FREQUENCY ISR
 	alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, freq_relay);
 
@@ -329,10 +431,10 @@ int main(int argc, char* argv[], char* envp[])
 int initOSDataStructs(void)
 {
 	freqQueue = xQueueCreate(FREQ_QUEUE_SIZE, sizeof(double));
-
 	msgqueue = xQueueCreate( MSG_QUEUE_SIZE, sizeof( void* ) );
-	shared_lcd_sem = xSemaphoreCreateCounting( 9999, 1 );
 
+	shared_lcd_sem = xSemaphoreCreateCounting( 9999, 1 );
+	shared_console_sem = xSemaphoreCreateCounting( 9999, 1 );
 	shared_sevenseg_sem = xSemaphoreCreateCounting( 9999, 1 );
 	shared_freq_sem = xSemaphoreCreateCounting( 9999, 1 );
 	return 0;
@@ -341,7 +443,9 @@ int initOSDataStructs(void)
 // This function creates the tasks used in this example
 int initCreateTasks(void)
 {
-	xTaskCreate(print_status_task, "print_status_task", TASK_STACKSIZE, NULL, PRINT_STATUS_TASK_PRIORITY, NULL);
+	xTaskCreate(print_lcd_task, "print_lcd_task", TASK_STACKSIZE, NULL, PRINT_LCD_TASK_PRIORITY, NULL);
+	xTaskCreate(print_console_task, "print_console_task", TASK_STACKSIZE, NULL, PRINT_CONSOLE_TASK_PRIORITY, NULL);
+
 	xTaskCreate(seven_seg_task, "seven_seg_task", TASK_STACKSIZE, NULL, SEVEN_SEG_TASK_PRIORITY, NULL);
 
 	xTaskCreate(switches_task, "switches_task", TASK_STACKSIZE, NULL, SWITCHES_TASK_PRIORITY, NULL);
