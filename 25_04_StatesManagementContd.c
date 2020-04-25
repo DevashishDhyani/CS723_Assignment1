@@ -12,7 +12,6 @@
 #include "alt_types.h"                 	// alt_u32 is a kind of alt_types
 #include "sys/alt_irq.h"              	// to register interrupts
 
-
 // Scheduler includes
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -29,8 +28,7 @@
 #define PRINT_LCD_TASK_PRIORITY 2
 #define PRINT_CONSOLE_TASK_PRIORITY 3
 
-#define SWITCHES_TASK_PRIORITY 4
-
+#define STATE_MANAGEMENT_TASK_PRIORITY 4
 #define UPDATE_LOAD_TASK_PRIORITY 5
 #define STABILITY_TASK_PRIORITY 6
 
@@ -40,13 +38,13 @@ FILE *lcd;
 #define ESC 27
 #define CLEAR_LCD_STRING "[2J"
 
-// Definition of Message Queue
-#define   MSG_QUEUE_SIZE  30
-QueueHandle_t msgqueue;
-
+// Definition of Frequency Queue
 #define FREQ_QUEUE_SIZE  10
 QueueHandle_t freqQueue;
 
+
+// Handlers
+TaskHandle_t state_management_handle;
 
 // used to delete a task
 TaskHandle_t xHandle;
@@ -56,9 +54,12 @@ SemaphoreHandle_t shared_lcd_sem;
 SemaphoreHandle_t shared_console_sem;
 SemaphoreHandle_t shared_sevenseg_sem;
 SemaphoreHandle_t shared_freq_sem; //protects freqArray, rocArray
+SemaphoreHandle_t shared_state_toggle_sem;
+SemaphoreHandle_t shared_stability_control_sem; //perhaps can just use freq_sem instead
 
 //Definition of Timer
 TimerHandle_t systemTimer;
+TimerHandle_t loadsTimer;
 
 // globals variables
 
@@ -74,7 +75,9 @@ int stateToggle = 0; //0 = maintenance mode, 1 = freq relay mode
 double freqArray[FREQ_QUEUE_SIZE] = {40, 40, 40, 40, 40, 40, 40, 40, 40, 40};
 double rocArray[FREQ_QUEUE_SIZE] = {40, 40, 40, 40, 40, 40, 40, 40, 40, 40};
 int freqIndex = 0;
-int stabilityControl = 0; //0= stable, 1 = unstable
+int stabilityControlNew = 0; //0= stable, 1 = unstable
+int stabilityControlOld = 0; //0= stable, 1 = unstable
+
 
 //time related
 int secondsCounter = 0;
@@ -99,12 +102,15 @@ void freq_relay(){
 	return;
 }
 
-
 //for system time
 void vSystemRunTimer(xTimerHandle t_timer){
 	secondsCounter = secondsCounter + 1;
 }
 
+//for loads time
+void vLoadsTimer(xTimerHandle t_timer){
+	//printf("500ms \n \n \n");
+}
 
 void ps2_isr (void* context, alt_u32 id)
 {
@@ -203,25 +209,11 @@ void button_interrupts_function(void* context, alt_u32 id)
   if(*temp==4) {
 	  //printf("State change button pressed \n \n");
 	  stateToggle = !stateToggle;
+	  //printf("State change button pressed \n \n");
   }
 
   // clears the edge capture register
   IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
-}
-
-//need to enable writing to a queue for this
-void switches_task(void *pvParameters)
-{
-	while (1)
-	{
-		unsigned int uiSwitchValue = 0;
-		// read the value of the switch and store to uiSwitchValue
-		uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
-		// write the value of the switches to the red LEDs
-		IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiSwitchValue);
-
-		vTaskDelay(200);
-	}
 }
 
 //need to follow a pattern to calc RoC, threshold check and overwriting old values
@@ -249,10 +241,12 @@ void stability_task(void *pvParameters)
 
 		//check if stability conditions are violated
 		if((freqArray[freqIndex] < thresholdFreq) || (rocArray[freqIndex] > thresholdROC)) {
-			stabilityControl = 1;
+			stabilityControlOld = stabilityControlNew;
+			stabilityControlNew = 1;
 		}
 		else {
-			stabilityControl = 0;
+			stabilityControlOld = stabilityControlNew;
+			stabilityControlNew = 0;
 		}
 
 		/*
@@ -268,9 +262,88 @@ void stability_task(void *pvParameters)
 			freqIndex = 0;
 		}
 
+		//printf("%d", freqIndex);
+
 		xSemaphoreGive(shared_freq_sem);
 
-		//maybe some sort of ulTaskNotifiy for LoadManager might be needed
+		xTaskNotifyGive(state_management_handle);
+	}
+}
+
+//need to enable writing to a queue for this
+void state_management_task(void *pvParameters)
+{
+	while (1)
+	{
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY ); /* Clear the notification value before exiting. & Block indefinitely. */
+
+		unsigned int uiSwitchValue = 0;
+		// read the value of the switch and store to uiSwitchValue
+		uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+
+		//printf("Switch %d \n", uiSwitchValue);
+
+		xSemaphoreTake(shared_state_toggle_sem, portMAX_DELAY);
+
+		xSemaphoreTake(shared_freq_sem, portMAX_DELAY);
+
+		//printf("State = %d \n", stateToggle);
+		//printf("Stability = %d \n", stabilityControl);
+
+		//maintenance mode
+		if(stateToggle == 0) {
+			// write the value of the switches to the  LEDs
+			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiSwitchValue);
+			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, 0);
+		}
+		//load management mode
+		else {
+			//stable
+			if(stabilityControlOld == 0 && stabilityControlNew == 0){
+				//timer is running
+				if(( xTimerIsTimerActive( loadsTimer ) != pdFALSE )) {
+
+				}
+				//timer isn't running
+				else {
+					// write the value of the switches to the  LEDs
+					IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiSwitchValue);
+					IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, 0);
+				}
+			}
+
+			//unstable
+			else if(stabilityControlOld == 1 && stabilityControlNew == 1){
+
+			}
+
+			//going from stable to unstable
+			else if(stabilityControlOld == 0 && stabilityControlNew == 1){
+				//timer currently active
+				if(( xTimerIsTimerActive( loadsTimer ) != pdFALSE )) {
+					//reset the timer
+					xTimerReset(loadsTimer,0);
+				}
+				//timer isn't running
+				else {
+					//start the timer
+					xTimerStart(loadsTimer, 0);
+				}
+			}
+
+			//going from unstable to stable
+			else if(stabilityControlOld == 1 && stabilityControlNew == 0){
+				//reset the timer
+				xTimerReset(loadsTimer,0);
+			}
+
+		}
+
+
+		xSemaphoreGive(shared_freq_sem);
+
+		xSemaphoreGive(shared_state_toggle_sem);
+
 	}
 }
 
@@ -355,6 +428,9 @@ void print_console_task(void *pvParameters)
 					else if((freqIndex-1-i) == -4) {
 						printf("%f = %d ", freqArray[6], 6);
 					}
+					else if((freqIndex-1-i) == -5) {
+						printf("%f = %d ", freqArray[5], 5);
+					}
 				}
 			}
 		}
@@ -380,6 +456,9 @@ int main(int argc, char* argv[], char* envp[])
 	if (xTimerStart(systemTimer, 0) != pdPASS){
 		printf("Cannot start timer");
 	}
+
+	loadsTimer = xTimerCreate("Loads Timer", 500, pdFALSE, NULL, vLoadsTimer);
+
 
 
 	//FREQUENCY ISR
@@ -431,12 +510,15 @@ int main(int argc, char* argv[], char* envp[])
 int initOSDataStructs(void)
 {
 	freqQueue = xQueueCreate(FREQ_QUEUE_SIZE, sizeof(double));
-	msgqueue = xQueueCreate( MSG_QUEUE_SIZE, sizeof( void* ) );
 
 	shared_lcd_sem = xSemaphoreCreateCounting( 9999, 1 );
 	shared_console_sem = xSemaphoreCreateCounting( 9999, 1 );
 	shared_sevenseg_sem = xSemaphoreCreateCounting( 9999, 1 );
 	shared_freq_sem = xSemaphoreCreateCounting( 9999, 1 );
+
+	shared_state_toggle_sem = xSemaphoreCreateCounting( 9999, 1 );
+	shared_stability_control_sem = xSemaphoreCreateCounting( 9999, 1 );
+
 	return 0;
 }
 
@@ -448,7 +530,7 @@ int initCreateTasks(void)
 
 	xTaskCreate(seven_seg_task, "seven_seg_task", TASK_STACKSIZE, NULL, SEVEN_SEG_TASK_PRIORITY, NULL);
 
-	xTaskCreate(switches_task, "switches_task", TASK_STACKSIZE, NULL, SWITCHES_TASK_PRIORITY, NULL);
+	xTaskCreate(state_management_task, "state_management_task", TASK_STACKSIZE, NULL, STATE_MANAGEMENT_TASK_PRIORITY, &state_management_handle);
 
 	xTaskCreate(stability_task, "stability_task", TASK_STACKSIZE, NULL, STABILITY_TASK_PRIORITY, NULL);
 
