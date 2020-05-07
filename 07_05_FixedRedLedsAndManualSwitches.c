@@ -59,6 +59,8 @@ SemaphoreHandle_t shared_stability_control_sem; //perhaps can just use freq_sem 
 
 //Definition of Timer
 TimerHandle_t systemTimer;
+TimerHandle_t loadsTimer;
+TimerHandle_t sheddingTimer;
 
 // globals variables
 
@@ -68,18 +70,34 @@ char tempThreshold[4] = "";
 int thresholdROC = 10;
 
 //state toggle
-int stateToggle = 0; //0 = maintenance mode, 1 = freq relay mode
+int stateToggle = 0; //0 = maintenance mode, 1 = load management mode
 
 //frequency related
 double freqArray[FREQ_QUEUE_SIZE] = {40, 40, 40, 40, 40, 40, 40, 40, 40, 40};
 double rocArray[FREQ_QUEUE_SIZE] = {40, 40, 40, 40, 40, 40, 40, 40, 40, 40};
 int freqIndex = 0;
-int stabilityControl = 0; //0= stable, 1 = unstable
+int stabilityControlNew = 0; //0= stable, 1 = unstable
+int stabilityControlOld = 0; //0= stable, 1 = unstable
 
 //time related
 int secondsCounter = 0;
+int timerExpired = 0;  //0 = not timed out, 1 = timed out
+int sheddingCounter = 0; //counts time in ms
+int minTimeShed = 999999; //min 1st load shed time
+int maxTimeShed = 0; //max 1st load shed time
+double averageTimeShed = 0.0;
 
+//switch related
+unsigned int uiSwitchValue;
+unsigned int uiSwitchValueOld;
 
+//roc related
+double rocSum = 0.0;
+double rocAverage = 0.0;
+unsigned int rocCounter = 0;
+
+//load related
+int describeBehaviour = 0; // 1 = connect, 2 = disconnect
 
 //debug variables
 unsigned int debugCounter =0;
@@ -90,6 +108,15 @@ int initCreateTasks(void);
 
 
 void freq_relay(){
+	/*
+	//sheddingCounter = 0;
+	if (xTimerStartFromISR(sheddingTimer, 0) != pdPASS){
+			printf("Cannot start timer");
+	}
+	//printf("Start shed timer \n");
+	*/
+
+	//printf("FREQ SENT \n");
 	unsigned int temp = IORD(FREQUENCY_ANALYSER_BASE, 0);
 	double tempFreq = 16000/(double) temp;
 	//printf("%d\n", debugCounter);
@@ -102,6 +129,17 @@ void freq_relay(){
 //for system time
 void vSystemRunTimer(xTimerHandle t_timer){
 	secondsCounter = secondsCounter + 1;
+}
+
+//for loads time
+void vLoadsTimer(xTimerHandle t_timer){
+	//printf("500ms \n \n \n");
+	timerExpired = 1;
+}
+
+//for 1st shed time
+void vSheddingTimer(xTimerHandle t_timer){
+	sheddingCounter = sheddingCounter + 1;
 }
 
 void ps2_isr (void* context, alt_u32 id)
@@ -217,27 +255,54 @@ void stability_task(void *pvParameters)
 
 		xSemaphoreTake(shared_freq_sem, portMAX_DELAY);
 
-		//printf("%f Hz in being RECEIVED\n", freqArray[freqIndex]);
 
+		//sheddingCounter = 0;
+		//xTimerStart(sheddingTimer, 0);
+
+
+		//printf("%f Hz in being RECEIVED\n", freqArray[freqIndex]);
+		//printf("FREQ RECEIVED \n");
 		//find ROC
 		if(freqIndex == 0){
 			double oldF = freqArray[9];
 			double newF = freqArray[0];
 			rocArray[0] = fabs(((newF - oldF) * newF * oldF * 2.0) / (newF + oldF));
+
+			if(stateToggle == 1) {
+				//printf("Roc = %f \n", rocArray[0]);
+				rocSum = rocSum + rocArray[0];
+				rocCounter++;
+				rocAverage = rocSum/rocCounter;
+				//printf("ROC AVERAGE = %f \n", rocAverage);
+			}
+
 		} else {
 			double oldF = freqArray[freqIndex-1];
 			double newF = freqArray[freqIndex];
 			rocArray[freqIndex] = fabs(((newF - oldF) * newF * oldF * 2.0) / (newF + oldF));
+
+			if(stateToggle == 1) {
+				//printf("Roc = %f \n", rocArray[freqIndex]);
+				rocSum = rocSum + rocArray[freqIndex];
+				rocCounter++;
+				rocAverage = rocSum/rocCounter;
+				//printf("ROC AVERAGE = %f \n", rocAverage);
+			}
 		}
 
+		//printf("RoC = %f \n", rocArray[freqIndex]);
 
 		//check if stability conditions are violated
 		if((freqArray[freqIndex] < thresholdFreq) || (rocArray[freqIndex] > thresholdROC)) {
-			stabilityControl = 1;
+			stabilityControlOld = stabilityControlNew;
+			stabilityControlNew = 1;
 		}
 		else {
-			stabilityControl = 0;
+			stabilityControlOld = stabilityControlNew;
+			stabilityControlNew = 0;
 		}
+
+		//printf("StabilityNew = %d \n", stabilityControlNew);
 
 		/*
 		printf("%f Instantaneous Frequency\n", freqArray[freqIndex]);
@@ -267,34 +332,146 @@ void state_management_task(void *pvParameters)
 	{
 		ulTaskNotifyTake(pdTRUE, portMAX_DELAY ); /* Clear the notification value before exiting. & Block indefinitely. */
 
-		unsigned int uiSwitchValue = 0;
+		uiSwitchValueOld = uiSwitchValue;
+
+		uiSwitchValue = 0;
 		// read the value of the switch and store to uiSwitchValue
 		uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
 
-		//printf("Switch %d \n", uiSwitchValue);
-
 		xSemaphoreTake(shared_state_toggle_sem, portMAX_DELAY);
-
 		xSemaphoreTake(shared_freq_sem, portMAX_DELAY);
 
+		//printf("FREQ BEING USED FOR LOADS \n");
 		//printf("State = %d \n", stateToggle);
 		//printf("Stability = %d \n", stabilityControl);
+
+		if(uiSwitchValue < uiSwitchValueOld) {
+			manualSwitchIntervention();
+		}
+
 
 		//maintenance mode
 		if(stateToggle == 0) {
 			// write the value of the switches to the  LEDs
 			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiSwitchValue);
 			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, 0);
+
+			//reset stabiltyControlNew
+			stabilityControlNew = 0;
+			stabilityControlOld = 0;
+
+			//switch of 500ms timer in case it's active
 		}
 		//load management mode
 		else {
+			//stable
+			if(stabilityControlOld == 0 && stabilityControlNew == 0){
+				//timed out
+				if(timerExpired == 1) {
+					describeBehaviour = 1; //asking for Connect
+					describeLEDS(describeBehaviour);
+
+					//check if all loads connected or not and start timer accordingly.
+					if(checkFullConnection()) {
+						//
+					}
+					else {
+						xTimerStart(loadsTimer, 0);
+					}
+
+					timerExpired = 0;
+				}
+				//timer is running
+				else if(xTimerIsTimerActive(loadsTimer) != pdFALSE ) {
+					//do Nothing
+				}
+				//timer hasn't started
+				else {
+					// write the value of the switches to the  LEDs
+					IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiSwitchValue);
+					IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, 0);
+				}
+			}
+
+			//unstable
+			else if(stabilityControlOld == 1 && stabilityControlNew == 1){
+				//timed out
+				if(timerExpired == 1) {
+					describeBehaviour = 2; //asking for Disconnect
+					describeLEDS(describeBehaviour);
+					xTimerStart(loadsTimer, 0);
+					timerExpired = 0;
+				}
+				//timer is running
+				else if(xTimerIsTimerActive(loadsTimer) != pdFALSE ) {
+					//do Nothing
+				}
+				//timer hasn't started
+				else {
+					printf("WTFFFFFFFFFFFFFFFFFFFF  Shouldn't trigger this condn here\n \n \n \n \n \n ");
+				}
+			}
+
+			//going from stable to unstable
+			else if(stabilityControlOld == 0 && stabilityControlNew == 1){
+				//timed out
+				if(timerExpired == 1) {
+					describeBehaviour = 1; //asking for Connect
+					describeLEDS(describeBehaviour);
+
+					//check if all loads connected or not and choose describeBehaviour and start timer
+					if(checkFullConnection()) {
+						describeBehaviour = 2; //asking for Disconnect
+						describeLEDS(describeBehaviour);
+					}
+					else {
+						//
+					}
+
+					xTimerStart(loadsTimer, 0);
+					timerExpired = 0;
+				}
+				//timer is running
+				else if(xTimerIsTimerActive(loadsTimer) != pdFALSE ) {
+					//reset the timer
+					xTimerReset(loadsTimer,0);
+				}
+				//timer hasn't started
+				else {
+					describeBehaviour = 2;
+					describeLEDS(describeBehaviour);
+					xTimerStart(loadsTimer, 0);
+					timerExpired = 0;
+				}
+			}
+
+			//going from unstable to stable
+			else if(stabilityControlOld == 1 && stabilityControlNew == 0){
+				//timed out
+				if(timerExpired == 1) {
+					describeBehaviour = 2; //asking for Disconnect
+					describeLEDS(describeBehaviour);
+					xTimerStart(loadsTimer, 0);
+					timerExpired = 0;
+				}
+				//timer is running
+				else if(xTimerIsTimerActive(loadsTimer) != pdFALSE ) {
+					//reset the timer
+					xTimerReset(loadsTimer,0);
+				}
+				//timer hasn't started
+				else {
+					printf("WTFFFFFFFFFFF Shouldn't trigger this condn here \n \n \n \n \n \n ");
+				}
+			}
 		}
 
 
+
+		//call function to update LEDS using describeBehaviour
+
 		xSemaphoreGive(shared_freq_sem);
-
 		xSemaphoreGive(shared_state_toggle_sem);
-
 	}
 }
 
@@ -319,7 +496,6 @@ void seven_seg_task(void *pvParameters)
 	}
 }
 
-
 // The following prints lcd status information every 0.5 seconds.
 void print_lcd_task(void *pvParameters)
 {
@@ -334,10 +510,10 @@ void print_lcd_task(void *pvParameters)
 			// clearing the LCD
 			fprintf(lcd, "%c%s", ESC, CLEAR_LCD_STRING);
 			fprintf(lcd, "Threshold = %d \n", thresholdFreq);
-			fprintf(lcd, "RoC = %d \n", thresholdROC);
+			fprintf(lcd, "RoC = %d, S = %d \n", thresholdROC, stateToggle);
+
 		}
 
-		//insert some code to release the semophore
 		xSemaphoreGive(shared_lcd_sem);
 
 		vTaskDelay(500);
@@ -351,7 +527,6 @@ void print_console_task(void *pvParameters)
 	while (1)
 	{
 		xSemaphoreTake(shared_console_sem, portMAX_DELAY);
-
 		xSemaphoreTake(shared_freq_sem, portMAX_DELAY);
 
 		printf("Frequency = ");
@@ -379,17 +554,20 @@ void print_console_task(void *pvParameters)
 					else if((freqIndex-1-i) == -4) {
 						printf("%f = %d ", freqArray[6], 6);
 					}
+					else if((freqIndex-1-i) == -5) {
+						printf("%f = %d ", freqArray[5], 5);
+					}
 				}
 			}
 		}
 
 
 		printf("\n");
-
 		printf("Total time system has been active = %d seconds \n", secondsCounter);
 
-		xSemaphoreGive(shared_freq_sem);
+		printf("Running Average of ROC = %f \n", rocAverage);
 
+		xSemaphoreGive(shared_freq_sem);
 		xSemaphoreGive(shared_console_sem);
 
 		vTaskDelay(1000);
@@ -405,10 +583,14 @@ int main(int argc, char* argv[], char* envp[])
 		printf("Cannot start timer");
 	}
 
+	//TIMER ISR for loads in freqRelay
+	loadsTimer = xTimerCreate("Loads Timer", 500, pdFALSE, NULL, vLoadsTimer);
+
+	//TIMER ISR for 1st load shed
+	sheddingTimer = xTimerCreate("Shedding Timer", 1, pdTRUE, NULL, vSheddingTimer);
 
 	//FREQUENCY ISR
 	alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, freq_relay);
-
 
 	//KEYBOARD ISR
 	alt_up_ps2_dev * ps2_device = alt_up_ps2_open_dev(PS2_NAME);
@@ -424,7 +606,6 @@ int main(int argc, char* argv[], char* envp[])
     // register the PS/2 interrupt
     IOWR_8DIRECT(PS2_BASE,4,1);
 
-
 	//BUTTON ISR
 	int buttonValue = 0;
 	// clears the edge capture register. Writing 1 to bit clears pending interrupt for corresponding button.
@@ -434,11 +615,10 @@ int main(int argc, char* argv[], char* envp[])
 	// register the ISR
 	alt_irq_register(PUSH_BUTTON_IRQ,(void*)&buttonValue, button_interrupts_function);
 
-
 	//LCD
 	lcd = fopen(CHARACTER_LCD_NAME, "w");
 
-
+	//Initializations
 	initOSDataStructs();
 	initCreateTasks();
 	vTaskStartScheduler();
@@ -472,13 +652,10 @@ int initCreateTasks(void)
 {
 	xTaskCreate(print_lcd_task, "print_lcd_task", TASK_STACKSIZE, NULL, PRINT_LCD_TASK_PRIORITY, NULL);
 	xTaskCreate(print_console_task, "print_console_task", TASK_STACKSIZE, NULL, PRINT_CONSOLE_TASK_PRIORITY, NULL);
-
 	xTaskCreate(seven_seg_task, "seven_seg_task", TASK_STACKSIZE, NULL, SEVEN_SEG_TASK_PRIORITY, NULL);
 
 	xTaskCreate(state_management_task, "state_management_task", TASK_STACKSIZE, NULL, STATE_MANAGEMENT_TASK_PRIORITY, &state_management_handle);
-
 	xTaskCreate(stability_task, "stability_task", TASK_STACKSIZE, NULL, STABILITY_TASK_PRIORITY, NULL);
-
 	//xTaskCreate(update_load_task, "update_load_task", TASK_STACKSIZE, NULL, UPDATE_LOAD_TASK_PRIORITY, NULL);
 
 	return 0;
@@ -486,49 +663,108 @@ int initCreateTasks(void)
 
 
 //Helper Functions
-// function to convert decimal to hexadecimal
-int decToHexa(int n)
+
+//This function finds the highest bit of a binary number. This is used to identify the highest priority load to recover.
+//Reference: https://stackoverflow.com/questions/53161/find-the-highest-order-bit-in-c
+int hob (int num)
 {
-    // char array to store hexadecimal number
-    char hexaDeciNum[100];
-    char correctOrder[100];
-    int tempPos = 0;
+    if (!num)
+        return 0;
 
-    // counter for hexadecimal number array
-    int i = 0;
-    while(n!=0)
-    {
-        // temporary variable to store remainder
-        int temp  = 0;
+    int ret = 1;
 
-        // storing remainder in temp variable.
-        temp = n % 16;
+    while (num >>= 1)
+        ret <<= 1;
 
-        // check if temp < 10
-        if(temp < 10)
-        {
-            hexaDeciNum[i] = temp + 48;
-            i++;
+    return ret;
+}
+
+//turns Red LEDs On/Off
+void describeLEDS(int describeBehaviour) {
+	// read the value of the switch and store to uiSwitchValue
+	//uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+    unsigned int red_led_value = IORD_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE);
+    unsigned int green_led_value = IORD_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE);
+
+	//connect highest priority
+	if(describeBehaviour == 1) {
+		//cond 1 : if switches == off, then no connection
+        if (uiSwitchValue == 0){
+            //no connection available - return
+            return;
         }
-        else
-        {
-            hexaDeciNum[i] = temp + 55;
-            i++;
+		//cond 2 : if switches == red leds (edge case), no connection possible
+        else if (uiSwitchValue == red_led_value){
+            //all loads connected, no other connection possible
+            return;
         }
+		//cond 3 : if switches != red leds, find highest load that can be turned on
+		//--here you check if your switch is on, check if led is off, compare with associated green led
+        else{
+            //returns the decimal value of the red LED you need to connect
+			int ledAdded = hob(uiSwitchValue - red_led_value);
 
-        n = n/16;
-    }
+			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, red_led_value + ledAdded);
 
-    // printing hexadecimal number array in reverse order
-    for(int j=i-1; j>=0; j--) {
-        //printf("%c",hexaDeciNum[j]);
-        //strcat(correctOrder,hexaDeciNum[j]);
-    	correctOrder[tempPos] = hexaDeciNum[j];
-    	tempPos++;
-    }
+			//NEED TO CHECK FOR OVERFLOW DUE TO UNSIGNED INT
+			if((green_led_value - ledAdded) < 0) {
+				IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, 0);
+				printf("OVERFLOW \n \n \n");
+			}
+			else {
+				IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, green_led_value - ledAdded);
+				//printf("Green Leds Turning Off \n");
+			}
 
+            return;
+        }
+	}
+	//disconnect lowest priority
+	else if (describeBehaviour == 2) {
+		//cond 1 : if switches == off, then no disconnection possible
+        if (uiSwitchValue == 0){
+            //there are no loads to shed
+            return;
+        }
+		//cond 2 : if switches == no red led (i.e. already been shed), then no disconnection possible
+        else if (red_led_value == 0){
+            //all loads have already been shed - there are no more loads to shed
+            return;
+        }
+		//cond 3 : if switches != red leds, find lowest load that can be turned off
+		//--here you check if switch is on, check if led is on
+        else {
+            int number = red_led_value;
+            int ledMinus = (number & -number);
+            IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, red_led_value - ledMinus);
+            IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, green_led_value + ledMinus);
+            return;
+        }
+	}
+	return;
+}
 
-    printf("%s \n", correctOrder);
-    printf("%d", atoi(correctOrder));
-    return(atoi(correctOrder));
+//checks if all loads have been connected or not
+int checkFullConnection() {
+	unsigned int red_led_value = IORD_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE);
+
+	if(red_led_value == uiSwitchValue) {
+		return 1;
+	}
+	else {
+		return 0;
+	}
+
+	return 0;
+}
+
+void manualSwitchIntervention() {
+	unsigned int red_led_value = IORD_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE);
+	unsigned int green_led_value = IORD_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE);
+
+	red_led_value &= uiSwitchValue;
+	green_led_value &= uiSwitchValue;
+
+	IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, red_led_value);
+	IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, green_led_value);
 }
